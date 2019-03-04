@@ -1406,9 +1406,11 @@ static int invalidate_mt_cache(jl_typemap_entry_t *oldentry, void *closure0)
     if (oldentry->max_world == ~(size_t)0) {
         jl_method_instance_t *mi = oldentry->func.linfo;
         jl_method_t *m = mi->def.method;
+        int intersects = 0;
         if (jl_is_method(env->shadowed)) {
-            if ((jl_value_t*)m == env->shadowed)
-                oldentry->max_world = env->max_world;
+            if ((jl_value_t*)m == env->shadowed) {
+                intersects = 1;
+            }
         }
         else {
             assert(jl_is_array(env->shadowed));
@@ -1416,10 +1418,18 @@ static int invalidate_mt_cache(jl_typemap_entry_t *oldentry, void *closure0)
             size_t i, n = jl_array_len(env->shadowed);
             for (i = 0; i < n; i++) {
                 if (m == d[i]->func.method) {
-                    oldentry->max_world = env->max_world;
-                    return 1;
+                    intersects = 1;
+                    break;
                 }
             }
+        }
+        if (intersects) {
+            if (JL_DEBUG_METHOD_INVALIDATION) {
+                jl_uv_puts(JL_STDOUT, "-- ", 4);
+                jl_static_show(JL_STDOUT, (jl_value_t*)mi);
+                jl_uv_puts(JL_STDOUT, "\n", 1);
+            }
+            oldentry->max_world = env->max_world;
         }
     }
     return 1;
@@ -2118,14 +2128,25 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t **args, uint32
     jl_methtable_t *mt = NULL;
     int i;
     // check each cache entry to see if it matches
-    for (i = 0; i < 4; i++) {
-        entry = call_cache[cache_idx[i]];
-        if (entry && nargs == jl_svec_len(entry->sig->parameters) &&
-            sig_match_fast(args, jl_svec_data(entry->sig->parameters), 0, nargs) &&
-            world >= entry->min_world && world <= entry->max_world) {
-            break;
-        }
-    }
+    //#pragma unroll
+    //for (i = 0; i < 4; i++) {
+    //    LOOP_BODY(i);
+    //}
+#define LOOP_BODY(_i) do { \
+            i = _i; \
+            entry = call_cache[cache_idx[i]]; \
+            if (entry && nargs == jl_svec_len(entry->sig->parameters) && \
+                sig_match_fast(args, jl_svec_data(entry->sig->parameters), 0, nargs) && \
+                world >= entry->min_world && world <= entry->max_world) { \
+                goto have_entry; \
+            } \
+        } while (0);
+    LOOP_BODY(0);
+    LOOP_BODY(1);
+    LOOP_BODY(2);
+    LOOP_BODY(3);
+#undef LOOP_BODY
+    i = 4;
     // if no method was found in the associative cache, check the full cache
     if (i == 4) {
         JL_TIMING(METHOD_LOOKUP_FAST);
@@ -2136,11 +2157,13 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t **args, uint32
             // put the entry into the cache if it's valid for a leafsig lookup,
             // using pick_which to slightly randomize where it ends up
             call_cache[cache_idx[++pick_which[cache_idx[0]] & 3]] = entry;
+            goto have_entry;
         }
     }
 
-    jl_method_instance_t *mfunc = NULL;
+    jl_method_instance_t *mfunc;
     if (entry) {
+have_entry:
         mfunc = entry->func.linfo;
     }
     else {
@@ -2177,11 +2200,23 @@ jl_method_instance_t *jl_lookup_generic(jl_value_t **args, uint32_t nargs, uint3
 
 JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t **args, uint32_t nargs)
 {
+    size_t world = jl_get_ptls_states()->world_age;
     jl_method_instance_t *mfunc = jl_lookup_generic_(args, nargs,
                                                      jl_int32hash_fast(jl_return_address()),
-                                                     jl_get_ptls_states()->world_age);
+                                                     world);
     JL_GC_PROMISE_ROOTED(mfunc);
-    jl_value_t *res = jl_invoke(mfunc, args, nargs);
+    jl_value_t *res;
+    // manually inline key parts of jl_invoke:
+    jl_code_instance_t *codeinst = mfunc->cache;
+    while (codeinst) {
+        if (codeinst->min_world <= world && world <= codeinst->max_world && codeinst->invoke != NULL) {
+            res = codeinst->invoke(codeinst, args, nargs);
+            return verify_type(res);
+        }
+        codeinst = codeinst->next;
+    }
+    codeinst = jl_compile_method_internal(mfunc, world);
+    res = codeinst->invoke(codeinst, args, nargs);
     return verify_type(res);
 }
 

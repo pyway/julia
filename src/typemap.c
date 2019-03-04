@@ -1016,8 +1016,14 @@ jl_typemap_entry_t *jl_typemap_insert(jl_typemap_t **cache, jl_value_t *parent,
         if (ml && ml->simplesig == (void*)jl_nothing) {
             if (overwritten != NULL)
                 *overwritten = ml->func.value;
-            if (newvalue == ml->func.value) // no change. TODO: involve world in computation!
+            if (newvalue == ml->func.value) {
+                // just update the existing entry to reflect new knowledge
+                if (ml->min_world > min_world)
+                    ml->min_world = min_world;
+                if (ml->max_world < max_world)
+                    ml->max_world = max_world;
                 return ml;
+            }
             if (newvalue == NULL)  // don't overwrite with guard entries
                 return ml;
             ml->max_world = min_world - 1;
